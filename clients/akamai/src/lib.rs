@@ -131,6 +131,8 @@ pub fn describe() -> ClientDescriptor {
                             .summary("Overrides how long the sensor is left running after load"),
                         field("post", Shape::optional(Shape::Bool))
                             .summary("Post the payload, on by default"),
+                        field("scripts", Shape::optional(Shape::Bool))
+                            .summary("Run the page's own scripts, on by default; off runs only the sensor"),
                     ],
                 ),
                 Shape::object(
@@ -490,6 +492,12 @@ fn config_shape() -> Shape {
                           arrives, so this is off by default and a session finishes in the time \
                           the work takes rather than the time the page would have spent")
                 .with_default(json!(false)),
+            field("jitter", Shape::Bool)
+                .summary("Randomise the sandbox's internal pacing per session: pointer stats, \
+                          input offsets, post gaps, quiet and pixel clocks. The values are all \
+                          constants otherwise, so this keeps the virtual timing from looking \
+                          identical across sessions")
+                .with_default(json!(false)),
             field("rounds", Shape::Int)
                 .summary("Payloads posted per solve")
                 .with_default(json!(2)),
@@ -540,6 +548,8 @@ struct Config {
     live_xhr: bool,
     #[serde(default)]
     wire_pace: bool,
+    #[serde(default)]
+    jitter: bool,
     #[serde(default)]
     prelude: Option<String>,
     #[serde(default = "default_load_posts")]
@@ -690,6 +700,7 @@ impl Akamai {
             pixel: self.config.pixel,
             live_xhr: self.config.live_xhr,
             wire_pace: self.config.wire_pace,
+            jitter: self.config.jitter,
             keep_payloads: self.config.keep_payloads,
             timeout_ms: self.config.timeout_ms,
             seed: self.config.seed.unwrap_or(0),
@@ -896,13 +907,17 @@ impl Client for Akamai {
                     .get("post")
                     .and_then(Value::as_bool)
                     .unwrap_or(!self.config.live_xhr);
+                let scripts = params
+                    .get("scripts")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
 
                 if let Some(wait) = params.get("wait_ms").and_then(Value::as_u64) {
                     self.config.wait_ms = wait;
                 }
 
                 let mut session = self.fresh()?;
-                let run = session.open(&url)?;
+                let run = session.open(&url, scripts)?;
                 self.last_run = run.clone();
                 call.check()?;
 
@@ -931,7 +946,8 @@ impl Client for Akamai {
                         let payload = if round == 0 {
                             first.clone()
                         } else {
-                            session.nudge(1500.0)?;
+                            let gap = session.round_gap();
+                            session.nudge(gap)?;
                             session.payload()?.unwrap_or_else(|| first.clone())
                         };
 
@@ -1001,7 +1017,8 @@ impl Client for Akamai {
                         Some(found) => found.clone(),
                         None => {
                             if round > 0 {
-                                session.nudge(1500.0)?;
+                                let gap = session.round_gap();
+                                session.nudge(gap)?;
                             }
                             session.payload()?.ok_or_else(|| {
                                 ClientError::internal("the sensor produced no payload")

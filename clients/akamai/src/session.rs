@@ -160,6 +160,7 @@ pub struct Settings {
     pub pixel: bool,
     pub live_xhr: bool,
     pub wire_pace: bool,
+    pub jitter: bool,
     pub keep_payloads: bool,
     pub timeout_ms: u64,
     pub seed: u64,
@@ -180,6 +181,7 @@ impl Default for Settings {
             pixel: true,
             live_xhr: true,
             wire_pace: false,
+            jitter: false,
             keep_payloads: false,
             timeout_ms: 90_000,
             seed: 0,
@@ -241,15 +243,45 @@ pub fn claim_of(profile: &Profile, user_agent: &str) -> Option<Claim> {
     })
 }
 
-fn pointer_shape() -> Shape {
+/// Cheap entropy for the optional timing jitter: system nanos, xor-shifted.
+fn entropy() -> u64 {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(1)
+        | 1;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+}
+
+/// Uniform value in [min, max).
+fn between(min: f64, max: f64) -> f64 {
+    min + (entropy() % 10_000) as f64 / 10_000.0 * (max - min)
+}
+
+fn pointer_shape(jitter: bool) -> Shape {
+    if !jitter {
+        return Shape {
+            step_px: 6.5,
+            sample_ms: 18.0,
+            jitter_px: 1.0,
+            overshoot: 0.05,
+            dwell_ms: 120.0,
+            flight_ms: 260.0,
+            pause_ms: 520.0,
+        };
+    }
+
     Shape {
-        step_px: 6.5,
-        sample_ms: 18.0,
-        jitter_px: 1.0,
-        overshoot: 0.05,
-        dwell_ms: 120.0,
-        flight_ms: 260.0,
-        pause_ms: 520.0,
+        step_px: between(5.0, 8.0),
+        sample_ms: between(14.0, 22.0),
+        jitter_px: between(0.7, 1.4),
+        overshoot: between(0.03, 0.08),
+        dwell_ms: between(90.0, 160.0),
+        flight_ms: between(200.0, 330.0),
+        pause_ms: between(400.0, 650.0),
     }
 }
 
@@ -1138,10 +1170,17 @@ impl Session {
         Ok((source, fetched))
     }
 
-    pub fn open(&mut self, url: &str) -> ClientResult<Value> {
+    pub fn open(&mut self, url: &str, page_scripts: bool) -> ClientResult<Value> {
         let began = std::time::Instant::now();
         let page = self.navigate(url)?;
         self.spent("akamai:navigate", began);
+        eprintln!(
+            "[wred] navigate {} -> {} ({} bytes) in {}ms",
+            url,
+            page.status,
+            self.html.len(),
+            began.elapsed().as_millis()
+        );
 
         if page.status >= 400 {
             return Err(ClientError::resource(format!(
@@ -1159,6 +1198,13 @@ impl Session {
         let began = std::time::Instant::now();
         let (source, assets) = self.fetch_page(&sensor.url)?;
         self.spent("akamai:assets", began);
+        eprintln!(
+            "[wred] sensor {} ({} bytes, {} assets) in {}ms",
+            sensor.url,
+            source.len(),
+            assets,
+            began.elapsed().as_millis()
+        );
 
         if source.len() < 1000 {
             return Err(ClientError::resource(format!(
@@ -1174,6 +1220,7 @@ impl Session {
         let began = std::time::Instant::now();
         self.mount()?;
         self.spent("akamai:mount", began);
+        eprintln!("[wred] mount in {}ms", began.elapsed().as_millis());
 
         if let Some(prelude) = self.settings.prelude.clone() {
             self.run(&prelude, "akamai:prelude")?;
@@ -1188,27 +1235,33 @@ impl Session {
             Ok::<(), ClientError>(())
         };
 
-        for script in scripts.iter().filter(|script| !script.deferred && script.before_sensor) {
-            execute(self, script, &mut ran)?;
+        if page_scripts {
+            for script in scripts.iter().filter(|script| !script.deferred && script.before_sensor) {
+                execute(self, script, &mut ran)?;
+            }
         }
 
         let (before, after) = std::mem::take(&mut self.inline_scripts);
 
-        for (index, source) in before.iter().enumerate() {
-            let threw = self.run(source, &format!("akamai:inline:{index}"))?;
-            ran.push(json!({ "url": format!("[inline {index}]"), "deferred": false, "threw": threw }));
+        if page_scripts {
+            for (index, source) in before.iter().enumerate() {
+                let threw = self.run(source, &format!("akamai:inline:{index}"))?;
+                ran.push(json!({ "url": format!("[inline {index}]"), "deferred": false, "threw": threw }));
+            }
         }
 
         let threw = self.run(&source, "akamai:sensor")?;
 
-        for script in scripts.iter().filter(|script| !script.deferred && !script.before_sensor) {
-            execute(self, script, &mut ran)?;
-        }
+        if page_scripts {
+            for script in scripts.iter().filter(|script| !script.deferred && !script.before_sensor) {
+                execute(self, script, &mut ran)?;
+            }
 
-        for (index, source) in after.iter().enumerate() {
-            let at = before.len() + index;
-            let threw = self.run(source, &format!("akamai:inline:{at}"))?;
-            ran.push(json!({ "url": format!("[inline {at}]"), "deferred": false, "threw": threw }));
+            for (index, source) in after.iter().enumerate() {
+                let at = before.len() + index;
+                let threw = self.run(source, &format!("akamai:inline:{at}"))?;
+                ran.push(json!({ "url": format!("[inline {at}]"), "deferred": false, "threw": threw }));
+            }
         }
 
         if let Some(browser) = self.browser.as_mut() {
@@ -1221,13 +1274,16 @@ impl Session {
         let pixel = if self.settings.pixel { self.run_pixel()? } else { Value::Null };
         self.spent("akamai:pixel-client", began);
 
-        for script in scripts.iter().filter(|script| script.deferred) {
-            execute(self, script, &mut ran)?;
+        if page_scripts {
+            for script in scripts.iter().filter(|script| script.deferred) {
+                execute(self, script, &mut ran)?;
+            }
         }
 
         let began = std::time::Instant::now();
         self.settle()?;
         self.spent("akamai:settle", began);
+        eprintln!("[wred] settle in {}ms", began.elapsed().as_millis());
 
         let browser = self.browser.as_mut().expect("mounted");
         let misses = browser.misses();
@@ -1279,9 +1335,25 @@ impl Session {
         browser.rate(1.0).ok();
         browser.running_script("").ok();
 
-        browser.settle(2).ok();
+        let settle_rounds = if self.settings.jitter {
+            1 + (entropy() % 3) as usize
+        } else {
+            2
+        };
+        browser.settle(settle_rounds).ok();
 
         self.spent(name, started);
+        eprintln!(
+            "[wred] run {} ({} bytes) -> {}ms {}",
+            name,
+            source.len(),
+            started.elapsed().as_millis(),
+            if threw.is_null() {
+                "ok".to_string()
+            } else {
+                format!("threw {threw}")
+            }
+        );
         Ok(threw)
     }
 
@@ -1333,7 +1405,12 @@ impl Session {
     fn wait_until_settled(&mut self, ms: f64) -> ClientResult<()> {
         self.pump(ms, |session| session.validated())?;
 
-        self.pump(200.0, |session| session.quiet())
+        let quiet_ms = if self.settings.jitter {
+            between(150.0, 350.0)
+        } else {
+            200.0
+        };
+        self.pump(quiet_ms, |session| session.quiet())
     }
 
     fn landed(&self) -> usize {
@@ -1386,8 +1463,13 @@ impl Session {
             .fire("focus", json!({ "target": "window" }))
             .map_err(failed)?;
 
-        let start = Point::new((target.x - 128.0).max(12.0), (target.y - 52.0).max(12.0));
-        let mut stream = Stream::new(seed, start, pointer_shape());
+        let (back_x, back_y) = if self.settings.jitter {
+            (between(90.0, 160.0), between(35.0, 70.0))
+        } else {
+            (128.0, 52.0)
+        };
+        let start = Point::new((target.x - back_x).max(12.0), (target.y - back_y).max(12.0));
+        let mut stream = Stream::new(seed, start, pointer_shape(self.settings.jitter));
         stream.pause();
         let _ = stream.click_at(target);
         stream.type_text(&typed);
@@ -1559,7 +1641,12 @@ impl Session {
     pub fn nudge(&mut self, ms: f64) -> ClientResult<()> {
         let seed = now_ms() as u64;
         let centre = self.viewport_centre()?;
-        let from = Point::new((centre.x - 110.0).max(12.0), (centre.y - 30.0).max(12.0));
+        let (back_x, back_y) = if self.settings.jitter {
+            (between(80.0, 150.0), between(20.0, 45.0))
+        } else {
+            (110.0, 30.0)
+        };
+        let from = Point::new((centre.x - back_x).max(12.0), (centre.y - back_y).max(12.0));
 
         let browser = self
             .browser
@@ -1570,14 +1657,29 @@ impl Session {
             ClientError::internal(format!("the sandbox stalled: {error}"))
         };
 
-        let mut stream = Stream::new(seed, from, pointer_shape());
-        stream.wait(90.0);
+        let mut stream = Stream::new(seed, from, pointer_shape(self.settings.jitter));
+        stream.wait(if self.settings.jitter {
+            between(40.0, 150.0)
+        } else {
+            90.0
+        });
         let _ = stream.move_to(centre);
         stream.pause();
 
         browser.play(stream.events()).map_err(failed)?;
         browser.advance(ms).map_err(failed)?;
         Ok(())
+    }
+
+    /// Gap between sensor payload posts. Nudge only advances the sandbox clock,
+    /// so this shapes the payload's virtual timing; jitter keeps it from being
+    /// the same constant 1500ms every round.
+    pub fn round_gap(&self) -> f64 {
+        if self.settings.jitter {
+            between(800.0, 2500.0)
+        } else {
+            1500.0
+        }
     }
 
     pub fn telemetry(&mut self) -> ClientResult<Option<String>> {
@@ -1738,8 +1840,13 @@ impl Session {
             .as_mut()
             .ok_or_else(|| ClientError::internal("the sandbox is not mounted"))?;
 
+        let pixel_ms = if self.settings.jitter {
+            between(800.0, 2000.0)
+        } else {
+            1200.0
+        };
         browser
-            .advance(1200.0)
+            .advance(pixel_ms)
             .map_err(|error| ClientError::internal(format!("the sandbox stalled: {error}")))?;
 
         let posted: Vec<Request> = browser
