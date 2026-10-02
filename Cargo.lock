@@ -3479,6 +3479,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wre-client-recaptcha"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "url",
+ "wre-client",
+ "wre-core",
+ "wre-live",
+ "wre-sandbox",
+]
+
+[[package]]
 name = "wre-clientd"
 version = "0.1.0"
 dependencies = [
@@ -3493,6 +3508,7 @@ dependencies = [
  "wre-client-altcha",
  "wre-client-example",
  "wre-client-kasada",
+ "wre-client-recaptcha",
  "wre-core",
 ]
 

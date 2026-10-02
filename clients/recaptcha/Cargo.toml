@@ -1,0 +1,20 @@
+[package]
+name = "wre-client-recaptcha"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mints Google reCAPTCHA Enterprise tokens headlessly by running the site's own recaptcha script in a V8 realm"
+
+[dependencies]
+wre-client.workspace = true
+wre-core.workspace = true
+wre-live.workspace = true
+wre-sandbox.workspace = true
+
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url.workspace = true

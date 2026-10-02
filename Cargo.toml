@@ -35,6 +35,7 @@ wre-client = { path = "crates/wre-client", version = "0.1.0" }
 wre-client-kasada = { path = "clients/kasada", version = "0.1.0" }
 wre-client-altcha = { path = "clients/altcha", version = "0.1.0" }
 wre-client-akamai = { path = "clients/akamai", version = "0.1.0" }
+wre-client-recaptcha = { path = "clients/recaptcha", version = "0.1.0" }
 wre-codegen = { path = "crates/wre-codegen", version = "0.1.0" }
 wre-client-example = { path = "clients/example", version = "0.1.0" }
 

@@ -29,7 +29,7 @@ impl Default for Fingerprint {
         Self {
             profile: Profile::Chrome140,
             platform: Platform::MacOS,
-            http2: true,
+            http2: std::env::var("WRE_HTTP2").map(|v| v != "0").unwrap_or(true),
             headers: true,
         }
     }
@@ -73,6 +73,14 @@ impl Fingerprint {
             .get(USER_AGENT)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
+    }
+
+    /// Whether `name` is part of a browser's claimed identity set, i.e. the
+    /// `user-agent` header or one of its matching `sec-ch-ua*` client hints.
+    /// These must always stay consistent with one another.
+    pub fn is_identity_header(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower == "user-agent" || lower.starts_with("sec-ch-ua")
     }
 
     pub fn profile_name(&self) -> String {

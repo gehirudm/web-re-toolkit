@@ -12,11 +12,12 @@ name = "wred"
 path = "src/main.rs"
 
 [features]
-default = ["target-example", "target-altcha", "target-akamai", "target-kasada"]
+default = ["target-example", "target-altcha", "target-akamai", "target-kasada", "target-recaptcha"]
 target-example = ["dep:wre-client-example"]
 target-kasada = ["dep:wre-client-kasada"]
 target-altcha = ["dep:wre-client-altcha"]
 target-akamai = ["dep:wre-client-akamai"]
+target-recaptcha = ["dep:wre-client-recaptcha"]
 
 [dependencies]
 wre-client.workspace = true
@@ -25,6 +26,7 @@ wre-client-example = { workspace = true, optional = true }
 wre-client-kasada = { workspace = true, optional = true }
 wre-client-altcha = { workspace = true, optional = true }
 wre-client-akamai = { workspace = true, optional = true }
+wre-client-recaptcha = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true

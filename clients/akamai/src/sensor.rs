@@ -28,16 +28,46 @@ pub fn wrap(payload: &str) -> String {
 }
 
 fn retimed(payload: &str) -> String {
-    let Ok(list) = std::env::var("WRE_AKAMAI_TIMINGS") else {
-        return payload.to_string();
-    };
-
-    let mut parts: Vec<&str> = payload.split(';').collect();
+    let mut parts: Vec<String> = payload.split(';').map(str::to_string).collect();
     if parts.len() < 8 {
         return payload.to_string();
     }
 
-    parts[6] = list.as_str();
+    // A sensor payload is only valid once: field 4 is a volatile counter and
+    // field 6 is the timing list. wred's `post` op re-posts the sandbox's own
+    // last payload, so a verbatim replay is a byte-identical sensor_data that
+    // an edge can use to fingerprint and rate-limit the client across every
+    // IP. Refresh the volatile fields on every wrap so no payload is ever
+    // posted twice. Field 5 is a hash the collection endpoint does not verify.
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_nanos() as u64)
+        .unwrap_or(1)
+        | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    if let Ok(number) = parts[4].parse::<u64>() {
+        parts[4] = (number + 1_000 + next() % 900_000).to_string();
+    }
+
+    if let Ok(list) = std::env::var("WRE_AKAMAI_TIMINGS") {
+        parts[6] = list;
+    } else if parts[6].contains(',') {
+        let timings: Vec<String> = parts[6]
+            .split(',')
+            .map(|value| match value.parse::<i64>() {
+                Ok(number) => (number + (next() % 63) as i64).max(0).to_string(),
+                Err(_) => value.to_string(),
+            })
+            .collect();
+        parts[6] = timings.join(",");
+    }
+
     parts.join(";")
 }
 

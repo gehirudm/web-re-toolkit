@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use wre_client::client::{Client, Registration};
-use wre_client::context::{Call, Ctx, FetchRequest, HttpOptions, Jar};
+use wre_client::context::{Call, Ctx, FetchRequest, Fingerprint, HttpOptions, Jar};
 use wre_client::error::{ClientError, ClientResult};
 use wre_client::shape::{Shape, field};
 use wre_client::spec::{Capabilities, ClientDescriptor, Concurrency, OpSpec};
@@ -1107,9 +1107,17 @@ impl Client for Akamai {
                     }
                 }
 
+                // Apply caller-supplied headers last, EXCEPT the browser
+                // identity set (user-agent / sec-ch-ua*). Overriding those would
+                // either double the UA (append) or desync it from the client
+                // hints; the session's coherent emulated identity is what the
+                // wire carries instead.
                 if let Some(headers) = params.get("headers").and_then(Value::as_object) {
                     for (name, value) in headers {
                         if let Some(text) = value.as_str() {
+                            if Fingerprint::is_identity_header(name) {
+                                continue;
+                            }
                             request = request.header(name.clone(), text.to_string());
                         }
                     }

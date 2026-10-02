@@ -86,7 +86,22 @@ impl Client {
             .redirect(if options.redirects == 0 {
                 wreq::redirect::Policy::none()
             } else {
-                wreq::redirect::Policy::limited(options.redirects)
+                let max = options.redirects;
+                wreq::redirect::Policy::custom(move |attempt| {
+                    // Only follow http(s) hops. If a redirect points at a
+                    // custom scheme (e.g. com.loblaw.loyalty://...), stop and
+                    // hand the 3xx response back to the caller so the custom
+                    // scheme is never handed to wreq's URL parser.
+                    match attempt.uri.scheme_str() {
+                        Some("http") | Some("https") => {}
+                        _ => return attempt.stop(),
+                    }
+                    if attempt.previous.len() >= max {
+                        attempt.error("too many redirects")
+                    } else {
+                        attempt.follow()
+                    }
+                })
             });
 
         if let Some(agent) = &options.user_agent {

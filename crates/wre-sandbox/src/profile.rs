@@ -7,7 +7,7 @@ use wre_core::error::{Error, Result};
 
 static BUNDLED_SURFACE: &str = include_str!("../assets/desktop-chrome.json");
 
-const BUNDLED_CHROME: &str = "151";
+const BUNDLED_CHROME: &str = "149";
 
 static BUNDLED: std::sync::LazyLock<Profile> = std::sync::LazyLock::new(|| {
     serde_json::from_str(BUNDLED_SURFACE).expect("the bundled surface parses")

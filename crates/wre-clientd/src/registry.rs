@@ -20,5 +20,8 @@ pub fn build() -> Result<Registry, String> {
     #[cfg(feature = "target-kasada")]
     registry.register(wre_client_kasada::registration())?;
 
+    #[cfg(feature = "target-recaptcha")]
+    registry.register(wre_client_recaptcha::registration())?;
+
     Ok(registry)
 }
