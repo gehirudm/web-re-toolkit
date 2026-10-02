@@ -439,6 +439,10 @@ fn config_shape() -> Shape {
                 .summary("Transport fingerprint as profile[:platform], defaults to the sandbox profile's user agent"),
             field("user_agent", Shape::optional(Shape::Str))
                 .summary("Overrides the user agent the sandbox profile carries"),
+            field("identity", Shape::optional(Shape::Str))
+                .summary("Which identity goes on the wire: the sandbox profile's (default) or, \
+                          with \"fingerprint\", the transport fingerprint's own user agent and \
+                          client hints"),
             field("wait_ms", Shape::Int)
                 .summary("Ceiling on the wait after the input stream. It ends as soon as the edge \
                           has validated the jar and the page has nothing left in flight, so a \
@@ -532,6 +536,8 @@ struct Config {
     fingerprint: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+    #[serde(default)]
+    identity: Option<String>,
     #[serde(default = "default_wait")]
     wait_ms: u64,
     #[serde(default = "default_init_cost")]
@@ -643,6 +649,19 @@ fn build(ctx: Ctx, config: Value) -> ClientResult<Box<dyn Client>> {
             .to_string()
     });
 
+    // With `identity` set to "fingerprint" (and no explicit `user_agent`), the
+    // wire identity follows the transport fingerprint instead of the sandbox
+    // profile's built-in browser.
+    let user_agent = match config.identity.as_deref() {
+        Some("fingerprint") if config.user_agent.is_none() => config
+            .fingerprint
+            .as_deref()
+            .and_then(|spec| spec.parse::<Fingerprint>().ok())
+            .and_then(|fingerprint| fingerprint.user_agent())
+            .unwrap_or(user_agent),
+        _ => user_agent,
+    };
+
     if user_agent.is_empty() {
         return Err(ClientError::bad_input(
             "the sandbox profile carries no user agent, set user_agent in the config",
@@ -733,8 +752,33 @@ impl Akamai {
         let profile = self.varied();
         let mut options = HttpOptions::with_proxy(self.config.proxy.as_deref());
         options.fingerprint = self.config.fingerprint.clone();
-        options.user_agent = Some(self.user_agent.clone());
-        options.claim = session::claim_of(&profile, &self.user_agent);
+
+        // The sandbox profile's own identity goes on the wire by default. With
+        // `identity` set to "fingerprint" (and no explicit `user_agent`), the
+        // transport fingerprint's user agent and client hints are used instead,
+        // so the wire identity follows the TLS fingerprint rather than the
+        // sandbox profile's built-in browser.
+        let fingerprint = match (self.config.identity.as_deref(), &self.config.user_agent) {
+            (Some("fingerprint"), None) => self
+                .config
+                .fingerprint
+                .as_deref()
+                .and_then(|spec| spec.parse::<Fingerprint>().ok()),
+            _ => None,
+        };
+
+        let user_agent = match &fingerprint {
+            Some(fingerprint) => fingerprint
+                .user_agent()
+                .unwrap_or_else(|| self.user_agent.clone()),
+            None => self.user_agent.clone(),
+        };
+
+        options.user_agent = Some(user_agent.clone());
+        options.claim = match &fingerprint {
+            Some(_) => None,
+            None => session::claim_of(&profile, &self.user_agent),
+        };
         options.timeout_secs = Some(self.config.timeout_ms.div_ceil(1000).max(1));
         options.jar = Some(self.jar.clone());
 
@@ -746,7 +790,7 @@ impl Akamai {
             profile,
             self.record.id.clone(),
             self.settings(),
-            self.user_agent.clone(),
+            user_agent,
         ))
     }
 
