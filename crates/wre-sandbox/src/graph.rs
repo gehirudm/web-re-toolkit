@@ -496,6 +496,20 @@ fn install_hosts(
         }),
     )?;
 
+    register(
+        realm,
+        "__wreGraphDump",
+        Box::new(|args| {
+            if let (Some(path), Some(text)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) {
+                let _ = std::fs::write(path, text.as_bytes());
+            }
+            Ok(Value::Null)
+        }),
+    )?;
+
     let watcher = shared.misses.clone();
     register(
         realm,
@@ -523,14 +537,80 @@ const SEED: &str =
 const EVALUATE: &str = "__ENV.evaluate = function (source) { return (0, eval)(source); };";
 
 fn install_environment(realm: &mut Realm, frame: Option<usize>, capture: bool) -> Result<()> {
+    let console = std::env::var("SQ_CONSOLE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let capture = capture
+        || std::env::var("SQ_CIPHER")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+    let rewrite = std::env::var("SQ_REWRITE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let trace = std::env::var("SQ_TRACE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let click = std::env::var("SQ_CLICK")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let dumpmark = std::env::var("SQ_DUMPMARK")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let runprog = std::env::var("SQ_RUNPROG").unwrap_or_default();
+    let runprog_step = if runprog.is_empty() {
+        String::new()
+    } else {
+        format!("globalThis.__wreRunProg = {};", serde_json::to_string(&runprog).unwrap_or_else(|_| "\"\"".to_string()))
+    };
     let steps = [
         (SEED, ""),
+        (runprog_step.as_str(), ""),
+        (
+            if dumpmark {
+                "globalThis.__wreDumpMarked = true;"
+            } else {
+                ""
+            },
+            "",
+        ),
+        (
+            if click {
+                "globalThis.__wreClick = true;"
+            } else {
+                ""
+            },
+            "",
+        ),
+        (
+            if trace {
+                "globalThis.__wreTrace = true;"
+            } else {
+                ""
+            },
+            "",
+        ),
+        (
+            if rewrite {
+                "globalThis.__wreRewrite = true;"
+            } else {
+                ""
+            },
+            "",
+        ),
         (BRIDGE, ""),
         (BOOTSTRAP, ""),
         (TABLES, ""),
         (
             if capture {
                 "__ENV.captureCipher = true;"
+            } else {
+                ""
+            },
+            "",
+        ),
+        (
+            if console {
+                "__ENV.captureConsole = true;"
             } else {
                 ""
             },
@@ -601,8 +681,11 @@ pub fn open(
 
     realm.eval_unit(SOURCES, "")?;
 
+    let mut frame_indices = Vec::new();
+
     for slot in 0..page.frames {
         let index = realm.open_frame()?;
+        frame_indices.push(index);
         realm.share_into(index, "globalThis.__SOURCES", "__SOURCES")?;
 
         install_hosts(
@@ -635,6 +718,11 @@ pub fn open(
     )?;
 
     install_environment(&mut realm, None, page.capture_cipher)?;
+
+    for index in &frame_indices {
+        realm.share_into(*index, "globalThis.__ENV", "__wreRootEnv")?;
+        realm.share_into(*index, "globalThis.__wreSparePool", "__wreSparePool")?;
+    }
 
     for (holder, key) in NATIVE {
         if realm.make_native(holder, key, Some(key)).is_err() {

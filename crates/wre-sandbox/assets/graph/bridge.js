@@ -14,8 +14,11 @@
   var deferred = [];
   var MAX_DELAY = 5000;
 
-  var spare = [];
+  var spare = globalThis.__wreSpare || [];
   var frames = new Map();
+
+  delete globalThis.__wreSpare;
+  globalThis.__wreSparePool = spare;
 
   (function () {
     var count = globalThis.__wreFrameCount || 0;
@@ -35,6 +38,15 @@
       spare.push({ view: view, env: env, pump: pump });
     }
   })();
+
+  globalThis.__wrePoolDebug = function () {
+    return {
+      pool: (globalThis.__wreSparePool || []).length,
+      built: spare.length,
+      frame: globalThis.__FRAME ? 1 : 0,
+      view0: typeof globalThis.__wreFrameView0 !== "undefined",
+    };
+  };
 
   var schedule = function (id, delay, extra) {
     var wait = typeof delay === "number" && isFinite(delay) ? delay : 0;
@@ -188,6 +200,13 @@
         headers = {};
       }
 
+      try {
+        var _line = String(method || "GET") + " " + String(url || "");
+        (globalThis.__REQS = globalThis.__REQS || []).push(_line);
+        var _doc = globalThis.document;
+        if (_doc) (_doc.__REQS = _doc.__REQS || []).push(_line);
+      } catch (error) {}
+
       var answer = hostSend({
         method: String(method || "GET"),
         url: String(url || ""),
@@ -200,10 +219,17 @@
     },
 
     createFrame: function () {
-      var held = spare.shift();
+      var pool = globalThis.__wreSparePool || spare;
+      var held = pool.shift();
 
       if (!held) {
-        hostMiss("no spare child realm for an iframe");
+        hostMiss(
+          "no spare child realm for an iframe (pool=" +
+            (pool && pool.length) +
+            ", frame=" +
+            (globalThis.__FRAME ? 1 : 0) +
+            ")",
+        );
         return null;
       }
 
@@ -213,14 +239,45 @@
 
     runInFrame: function (view, source, name, inline) {
       var held = frames.get(view);
-      if (!held) return false;
+      if (!held) {
+        hostMiss("runInFrame: no held realm for view (" + String(name) + ")");
+        return false;
+      }
 
       try {
         held.env.beginScript(String(name || "frame.js"), Boolean(inline));
-        held.env.evaluate(String(source));
+        var marked = String(source);
+        if (globalThis.__wreRewrite && marked.indexOf("throw new TypeError") !== -1 && marked.indexOf("documentElement.innerHTML=") === -1) {
+          marked = marked.replace(/!\(typeof ([A-Za-z0-9_$]+)(?:!==|===)([A-Za-z0-9_$]+)\(([A-Za-z0-9_$]+)\.([A-Za-z0-9_$]+)\)\)/g, function (whole, value, fn, obj, key) {
+            return "(function(){var ok=(typeof " + value + "===" + fn + "(" + obj + "." + key + "));try{if(!ok){var rg=globalThis;if(!rg.__wreA)rg.__wreA=[];var msg=String(" + fn + "(" + obj + "." + key + "))+' :: '+typeof " + value + "+' :: '+String(" + obj + "&&" + obj + ".constructor&&" + obj + ".constructor.name)+' :: val='+String(" + value + ").slice(0,140)+' :: '+((new Error).stack||'').split('\\n').slice(1,6).join(' | ');if(rg.__wreA.length<40)rg.__wreA.push(msg);try{if(rg.__wreRootEnv){var _e={kind:'assert',detail:msg,at:Date.now()};if(rg.__wreRootEnv.log)rg.__wreRootEnv.log.push(_e);if(rg.__wreRootEnv.logMirror)rg.__wreRootEnv.logMirror.push(_e);}}catch(q){}}}catch(err){}return !ok;})()";
+          });
+          marked = marked.replace(/typeof ([A-Za-z0-9_$]+)!==([A-Za-z0-9_$]+)\(([A-Za-z0-9_$]+)\.([A-Za-z0-9_$]+)\)\)throw new TypeError/g, function (whole, value, fn, obj, key) {
+            return 'typeof ' + value + '!==' + fn + '(' + obj + '.' + key + '))throw new TypeError("WRE_GUARD exp="+String(' + fn + '(' + obj + '.' + key + '))+" got="+typeof ' + value + '+" obj="+(function(){try{return String(' + obj + '&&' + obj + '.constructor&&' + obj + '.constructor.name);}catch(e){return "?";}})()+"@"+((new Error).stack||"").split("\\n").slice(1,7).join(" | "))';
+          });
+          marked = marked.replace(/typeof ([A-Za-z0-9_$]+)!==([A-Za-z0-9_$]+)\[([A-Za-z0-9_$]+)\(([0-9]+)\)\]\)throw new TypeError/g, function (whole, value, obj, fn, num) {
+            return 'typeof ' + value + '!==' + obj + '[' + fn + '(' + num + ')]' +
+              ')throw new TypeError("WRE_G2 exp="+String(' + obj + '[' + fn + '(' + num + ')])+" got="+typeof ' + value +
+              '+" val="+String((function(){try{return typeof ' + value + '==="object"&&' + value + '?' + value + '.constructor&&' + value + '.constructor.name:' + value + ';}catch(e){return "?";}})()).slice(0,60)' +
+              '+"@"+((new Error).stack||"").split("\\n").slice(1,7).join(" | "))';
+          });
+          var nth = 0;
+          marked = marked.replace(/throw new TypeError(?!\()/g, function () {
+            nth += 1;
+            return 'throw new TypeError("WRE#' + nth + '@" + ((new Error).stack||"").split("\\n").slice(1,9).join(" | "))';
+          });
+        }
+        if (globalThis.__wreDumpMarked && marked.length > 100000 && typeof __wreGraphDump === "function") {
+          try { __wreGraphDump("/tmp/wre_marked.js", marked); } catch (dumpError) {}
+        }
+        held.env.evaluate(marked);
         return true;
       } catch (error) {
-        hostMiss("frame script " + String(name) + ": " + String(error && error.message));
+        hostMiss(
+          "frame script " + String(name) + ": " +
+            String(error && error.name) + ": " +
+            String(error && error.message) + " :: " +
+            String(error && error.stack),
+        );
         return false;
       } finally {
         held.env.endScript();
@@ -236,6 +293,65 @@
         return true;
       } catch (error) {
         hostMiss("frame postMessage: " + String(error && error.message));
+        return false;
+      }
+    },
+
+    deliverRoot: function (message, origin, source) {
+      var rootEnv = null;
+
+      try {
+        rootEnv = globalThis.__wreRootEnv || null;
+      } catch (error) {}
+
+      if (!rootEnv || typeof rootEnv.deliverMessage !== "function") return false;
+
+      try {
+        rootEnv.deliverMessage(message, origin, source);
+        return true;
+      } catch (error) {
+        hostMiss("root postMessage: " + String(error && error.message));
+        return false;
+      }
+    },
+
+    setFrameLocation: function (view, url) {
+      var held = frames.get(view);
+      if (!held || !held.env || typeof held.env.setLocation !== "function") return false;
+
+      try {
+        held.env.setLocation(String(url));
+        return true;
+      } catch (error) {
+        return false;
+      }
+    },
+
+    setFrameBase: function (view, href) {
+      var held = frames.get(view);
+      if (!held || !held.env) return false;
+
+      try {
+        var value = String(href == null ? "" : href);
+        if (/^https?:/i.test(value)) held.env.defaultBase = value;
+        return true;
+      } catch (error) {
+        return false;
+      }
+    },
+
+    setFrameElement: function (view, element) {
+      var held = frames.get(view);
+      if (!held) return false;
+
+      try {
+        if (held.env && typeof held.env.setFrameElement === "function") {
+          held.env.setFrameElement(element);
+        } else if (view) {
+          view.__wreFrameElement = element;
+        }
+        return true;
+      } catch (error) {
         return false;
       }
     },
@@ -273,7 +389,7 @@
           owner.fire(ready[at].id, ready[at].extra);
           ran += 1;
         } catch (error) {
-          hostMiss("timer " + ready[at].id + ": " + String(error && error.message));
+          hostMiss("timer " + ready[at].id + ": " + String(error && error.message) + " :: " + String(error && error.stack));
         }
       }
 

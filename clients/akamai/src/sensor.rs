@@ -33,16 +33,31 @@ fn retimed(payload: &str) -> String {
         return payload.to_string();
     }
 
-    // A sensor payload is only valid once: field 4 is a volatile counter and
-    // field 6 is the timing list. wred's `post` op re-posts the sandbox's own
-    // last payload, so a verbatim replay is a byte-identical sensor_data that
-    // an edge can use to fingerprint and rate-limit the client across every
-    // IP. Refresh the volatile fields on every wrap so no payload is ever
-    // posted twice. Field 5 is a hash the collection endpoint does not verify.
+    // Field 5 is the per-load hash: fixed for a whole session, fresh for every
+    // load. Derive the session constants from it.
+    let fingerprint = parts
+        .get(5)
+        .map(|value| {
+            value.bytes().fold(0u64, |acc, byte| {
+                acc.wrapping_mul(1099511628211).wrapping_add(u64::from(byte))
+            })
+        })
+        .unwrap_or(1)
+        | 1;
+
+    // A sensor payload is only valid once, and an edge scores what it contains.
+    // The fields that matter here: 4 is the client id (the site keeps it fixed
+    // for the whole session), 6 is the timing tuple, whose last entry is a
+    // running uptime in milliseconds and whose second to last entry is a small
+    // count. wred's sandbox emits a stub id and a zeroed tuple, which is not a
+    // physical client, so the collection endpoint answers without promoting the
+    // cookie. Rewrite those fields per the captured shape and refresh the
+    // volatile ones on every wrap so no payload is ever posted twice.
     let mut state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|delta| delta.as_nanos() as u64)
         .unwrap_or(1)
+        ^ fingerprint
         | 1;
     let mut next = move || {
         state ^= state << 13;
@@ -51,21 +66,31 @@ fn retimed(payload: &str) -> String {
         state
     };
 
-    if let Ok(number) = parts[4].parse::<u64>() {
-        parts[4] = (number + 1_000 + next() % 900_000).to_string();
-    }
-
     if let Ok(list) = std::env::var("WRE_AKAMAI_TIMINGS") {
         parts[6] = list;
     } else if parts[6].contains(',') {
-        let timings: Vec<String> = parts[6]
+        let mut timings: Vec<i64> = parts[6]
             .split(',')
-            .map(|value| match value.parse::<i64>() {
-                Ok(number) => (number + (next() % 63) as i64).max(0).to_string(),
-                Err(_) => value.to_string(),
-            })
+            .map(|value| value.parse::<i64>().unwrap_or(0))
             .collect();
-        parts[6] = timings.join(",");
+        let last = timings.len().saturating_sub(1);
+        let uptime = 1_200 + (fingerprint % 2_400) as i64 + (next() % 180) as i64;
+
+        for (index, timing) in timings.iter_mut().enumerate() {
+            if index == last {
+                *timing = uptime;
+            } else if index + 1 == last && *timing <= 0 {
+                *timing = (6 + next() % 23) as i64;
+            } else if *timing > 1 {
+                *timing += (next() % 63) as i64;
+            }
+        }
+
+        parts[6] = timings
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<String>>()
+            .join(",");
     }
 
     parts.join(";")

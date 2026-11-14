@@ -20,8 +20,12 @@ static CHALLENGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(sec-cpt|_sec/cp_challenge|challenge_id|cp_challenge)"#).expect("challenge pattern")
 });
 
+static APPATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)_appath\s*=\s*["']([^"']+)["']"#).expect("appath pattern")
+});
+
 static SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,24}$").expect("segment pattern"));
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").expect("segment pattern"));
 
 const MARK: &str = "aeiouy13579";
 
@@ -114,8 +118,28 @@ pub fn discover(html: &str, base: &str) -> Surface {
         });
     }
 
+    let appath = APPATH
+        .captures(html)
+        .and_then(|found| found.get(1))
+        .map(|part| part.as_str())
+        .filter(|href| looks_obfuscated(href, base))
+        .map(|href| Script {
+            kind: Kind::Obfuscated,
+            url: absolute(base, href),
+            name: String::new(),
+            generation: 0,
+        });
+
+    if let Some(script) = &appath
+        && !obfuscated.iter().any(|found| found.url == script.url)
+    {
+        obfuscated.push(script.clone());
+    }
+
     let plain_akam = akam.iter().find(|script| script.kind == Kind::Sensor).cloned();
-    let sensor = obfuscated.first().cloned().or_else(|| plain_akam.clone());
+    let sensor = appath
+        .or_else(|| obfuscated.first().cloned())
+        .or_else(|| plain_akam.clone());
 
     let pixel_client = match (&sensor, &plain_akam) {
         (Some(chosen), Some(plain)) if chosen.url != plain.url => Some(plain.clone()),
@@ -289,6 +313,15 @@ mod tests {
 <script src="https://www.example.com/akam/11/5c9e4a7b"></script>
 </head></html>"#;
 
+    const KOHLS: &str = r#"
+<html><head>
+<script src="/Q1DgYjXVP7bE4nUUDamXFlB5UKg/ctViLO/FnYIZkc/VxpyXn/V7K2cr" defer></script>
+</head><body>
+<script>var _appath='/Q1DgYjXVP7bE4nUUDamXFlB5UKg/X3Vikp7LuNYt8L7fup/SFwXZkc/by9mZW/U5UVg';</script>
+<script src="/Q1DgYjXVP7bE4nUUDamXFlB5UKg/X3Vikp7LuNYt8L7fup/SFwXZkc/by9mZW/U5UVg"></script>
+</body></html>
+"#;
+
     #[test]
     fn the_obfuscated_path_is_the_sensor_and_the_akam_script_is_the_pixel_client() {
         let surface = discover(MAERSK, "https://www.maersk.com/tracking/ABC1234567");
@@ -343,6 +376,24 @@ mod tests {
             read_config("https://www.maersk.com/pWSY7c1/2ib/AKfr/hFDsQoTHmWt/YwEfMkyRK8U/Y3g/AWJXAjJfBQ")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_long_first_segment_is_still_obfuscated() {
+        assert!(looks_obfuscated(
+            "/Q1DgYjXVP7bE4nUUDamXFlB5UKg/ctViLO/FnYIZkc/VxpyXn/V7K2cr",
+            "https://www.kohls.com/"
+        ));
+    }
+
+    #[test]
+    fn the_appath_script_wins_over_the_first_obfuscated_script() {
+        let surface = discover(KOHLS, "https://www.kohls.com/gtBl/abc");
+
+        let sensor = surface.sensor.clone().expect("sensor");
+        assert_eq!(sensor.kind, Kind::Obfuscated);
+        assert!(sensor.url.ends_with("/by9mZW/U5UVg"));
+        assert!(surface.config.is_some());
     }
 
     #[test]

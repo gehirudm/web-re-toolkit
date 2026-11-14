@@ -3494,6 +3494,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wre-client-turnstile"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand",
+ "serde",
+ "serde_json",
+ "tracing",
+ "url",
+ "wre-client",
+ "wre-core",
+ "wre-live",
+ "wre-sandbox",
+]
+
+[[package]]
 name = "wre-clientd"
 version = "0.1.0"
 dependencies = [
@@ -3509,6 +3525,7 @@ dependencies = [
  "wre-client-example",
  "wre-client-kasada",
  "wre-client-recaptcha",
+ "wre-client-turnstile",
  "wre-core",
 ]
 

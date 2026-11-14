@@ -159,6 +159,7 @@ pub struct Settings {
     pub behaviour: bool,
     pub pixel: bool,
     pub live_xhr: bool,
+    pub deferred_scripts: bool,
     pub wire_pace: bool,
     pub jitter: bool,
     pub keep_payloads: bool,
@@ -180,6 +181,7 @@ impl Default for Settings {
             behaviour: true,
             pixel: true,
             live_xhr: true,
+            deferred_scripts: true,
             wire_pace: false,
             jitter: false,
             keep_payloads: false,
@@ -417,8 +419,10 @@ struct Wire {
     jar: Jar,
     page_url: String,
     origin: String,
+    sensor_url: String,
     referer: String,
     user_agent: String,
+    apple: bool,
     hints: Vec<(String, String)>,
     languages: String,
     enabled: bool,
@@ -525,11 +529,24 @@ impl Transport for Live {
 impl Wire {
     fn send(&self, request: &Request) -> Answer {
         let bytes = request.body.as_ref().map(String::len).unwrap_or_default();
+        let mut target = request.url.clone();
+
+        if request.method.eq_ignore_ascii_case("POST")
+            && !self.sensor_url.is_empty()
+            && target != self.sensor_url
+            && request.body.as_deref().is_some_and(|body| body.contains("sensor_data"))
+            && matches!(
+                (Url::parse(&target), Url::parse(&self.origin)),
+                (Ok(ref to), Ok(ref origin)) if to.host_str() == origin.host_str() && (to.path() == "/" || to.path().is_empty())
+            )
+        {
+            target = self.sensor_url.clone();
+        }
 
         if !self.enabled {
             let mut sent = self.sent.lock().unwrap_or_else(|error| error.into_inner());
             sent.push(Sent {
-                url: request.url.clone(),
+                url: target.clone(),
                 status: 0,
                 bytes,
                 live: false,
@@ -543,7 +560,7 @@ impl Wire {
         }
 
         let mut outgoing = FetchRequest {
-            url: request.url.clone(),
+            url: target.clone(),
             method: request.method.to_uppercase(),
             headers: Vec::new(),
             body: request.body.as_ref().map(|body| body.as_bytes().to_vec()),
@@ -551,13 +568,12 @@ impl Wire {
             order: XHR_ORDER.iter().map(|name| name.to_string()).collect(),
         };
 
-        let cross = !self.same_origin(&request.url);
+        let cross = !self.same_origin(&target);
 
         let mut headers: BTreeMap<String, String> = BTreeMap::from([
             ("accept".to_string(), "*/*".to_string()),
-            ("accept-encoding".to_string(), "gzip, deflate, br, zstd".to_string()),
+            ("accept-encoding".to_string(), if self.apple { "gzip, deflate, br".to_string() } else { "gzip, deflate, br, zstd".to_string() }),
             ("accept-language".to_string(), self.languages.clone()),
-            ("priority".to_string(), "u=1, i".to_string()),
             ("sec-fetch-dest".to_string(), "empty".to_string()),
             ("sec-fetch-mode".to_string(), "cors".to_string()),
             (
@@ -566,6 +582,9 @@ impl Wire {
             ),
             ("user-agent".to_string(), self.user_agent.clone()),
         ]);
+        if !self.apple {
+            headers.insert("priority".to_string(), "u=1, i".to_string());
+        }
 
         if cross || outgoing.method != "GET" {
             headers.insert("origin".to_string(), self.origin.clone());
@@ -623,7 +642,7 @@ impl Wire {
 
         let mut sent = self.sent.lock().unwrap_or_else(|error| error.into_inner());
         sent.push(Sent {
-            url: request.url.clone(),
+            url: target.clone(),
             status: answer.status,
             bytes,
             live: true,
@@ -837,8 +856,13 @@ impl Session {
             jar: self.jar.clone(),
             page_url: self.page_url.clone(),
             origin,
+            sensor_url: self.sensor_url.clone(),
             referer: self.page_url.clone(),
             user_agent: self.user_agent.clone(),
+            apple: {
+                let ua = self.user_agent.as_str();
+                ua.contains("Safari/") && ua.contains("Version/") && !ua.contains("Chrome/") && !ua.contains("Chromium/")
+            },
             hints: self.hints.clone(),
             languages: self.languages.clone(),
             enabled: self.settings.live_xhr,
@@ -1274,7 +1298,7 @@ impl Session {
         let pixel = if self.settings.pixel { self.run_pixel()? } else { Value::Null };
         self.spent("akamai:pixel-client", began);
 
-        if page_scripts {
+        if page_scripts && self.settings.deferred_scripts {
             for script in scripts.iter().filter(|script| script.deferred) {
                 execute(self, script, &mut ran)?;
             }
@@ -1332,15 +1356,14 @@ impl Session {
             Err(error) => json!(error.to_string()),
         };
 
-        browser.rate(1.0).ok();
-        browser.running_script("").ok();
-
         let settle_rounds = if self.settings.jitter {
             1 + (entropy() % 3) as usize
         } else {
             2
         };
         browser.settle(settle_rounds).ok();
+        browser.rate(1.0).ok();
+        browser.running_script("").ok();
 
         self.spent(name, started);
         eprintln!(
@@ -1434,7 +1457,7 @@ impl Session {
         }
     }
 
-    fn validated(&self) -> bool {
+    pub fn validated(&self) -> bool {
         self.cookies()
             .abck
             .map(|abck| abck.validated)
@@ -1471,11 +1494,19 @@ impl Session {
         let start = Point::new((target.x - back_x).max(12.0), (target.y - back_y).max(12.0));
         let mut stream = Stream::new(seed, start, pointer_shape(self.settings.jitter));
         stream.pause();
-        let _ = stream.click_at(target);
+        if self.mobile() {
+            let _ = stream.tap(target);
+        } else {
+            let _ = stream.click_at(target);
+        }
         stream.type_text(&typed);
 
         if let Some(submit) = submit {
-            let _ = stream.click_at(submit);
+            if self.mobile() {
+                let _ = stream.tap(submit);
+            } else {
+                let _ = stream.click_at(submit);
+            }
         }
 
         let before = self.sensor_posts();
@@ -1494,6 +1525,20 @@ impl Session {
         self.wait_for_posts(before + 1, self.settings.load_posts_ms)?;
         self.spent("akamai:input-post", began);
         Ok(())
+    }
+
+    fn mobile(&self) -> bool {
+        ["iPhone", "iPad", "iPod", "Android"]
+            .iter()
+            .any(|token| self.user_agent.contains(token))
+    }
+
+    fn apple_safari(&self) -> bool {
+        let agent = self.user_agent.as_str();
+        agent.contains("Safari/")
+            && agent.contains("Version/")
+            && !agent.contains("Chrome/")
+            && !agent.contains("Chromium/")
     }
 
     fn typed_text(&self, seed: u64) -> String {
@@ -1757,12 +1802,15 @@ impl Session {
             .map(|parsed| format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default()))
             .unwrap_or_default();
 
+        let safari = self.apple_safari();
         let mut request = FetchRequest::post(url.clone(), sensor::wrap(payload).into_bytes())
             .ordered(&XHR_ORDER)
             .header("accept", "*/*")
-            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .header(
+                "accept-encoding",
+                if safari { "gzip, deflate, br" } else { "gzip, deflate, br, zstd" },
+            )
             .header("accept-language", self.languages.clone())
-            .header("priority", "u=1, i")
             .header("content-type", "text/plain;charset=UTF-8")
             .header("origin", origin)
             .header("referer", self.page_url.clone())
@@ -1770,6 +1818,10 @@ impl Session {
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-site", "same-origin")
             .header("user-agent", self.user_agent.clone());
+
+        if !safari {
+            request = request.header("priority", "u=1, i");
+        }
 
         for (name, value) in &self.hints {
             request = request.header(name.clone(), value.clone());

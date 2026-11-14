@@ -3603,6 +3603,13 @@
 
   var navigator = globalThis.navigator;
 
+  // Mobile Safari has a distinct surface: touch/gesture handlers, a legacy
+  // orientation accessor and standalone flag, no Notification/PushManager in a
+  // tab, and none of the Chromium-only navigator extensions. Drive that from
+  // the profile's user agent so a captured iPhone profile gets the same set of
+  // globals the captured device reports.
+  var mobileSafari = /iPhone|iPad|iPod/.test(String(navigator.userAgent || ""));
+
   function branded(interfaceName, members) {
     var Ctor = globalThis[interfaceName];
 
@@ -3650,11 +3657,15 @@
     spend(4);
     return false;
   });
-  navigatorValue("taintEnabled", function taintEnabled() { return false; });
-  navigatorValue("vibrate", function vibrate() { return true; });
+  if (!mobileSafari) {
+    navigatorValue("taintEnabled", function taintEnabled() { return false; });
+    navigatorValue("vibrate", function vibrate() { return true; });
+  }
   navigatorValue("getGamepads", function getGamepads() { return [null, null, null, null]; });
-  navigatorValue("registerProtocolHandler", function registerProtocolHandler() {});
-  navigatorValue("unregisterProtocolHandler", function unregisterProtocolHandler() {});
+  if (!mobileSafari) {
+    navigatorValue("registerProtocolHandler", function registerProtocolHandler() {});
+    navigatorValue("unregisterProtocolHandler", function unregisterProtocolHandler() {});
+  }
   navigatorValue("requestMediaKeySystemAccess", function requestMediaKeySystemAccess() {
     return Promise.reject(new Error("not supported"));
   });
@@ -3871,17 +3882,39 @@
     writeText: function () { return Promise.resolve(); }
   }));
 
-  navigatorValue("bluetooth", branded("Bluetooth", {
-    getAvailability: function () { return Promise.resolve(false); },
-    requestDevice: function () { return Promise.reject(new Error("Bluetooth adapter not available.")); }
-  }));
+  if (!mobileSafari) {
+    navigatorValue("bluetooth", branded("Bluetooth", {
+      getAvailability: function () { return Promise.resolve(false); },
+      requestDevice: function () { return Promise.reject(new Error("Bluetooth adapter not available.")); }
+    }));
+  }
 
   navigatorValue("wakeLock", branded("WakeLock", { request: function () { return Promise.reject(new Error("not allowed")); } }));
   navigatorValue("locks", branded("LockManager", { query: function () { return Promise.resolve({ held: [], pending: [] }); } }));
-  navigatorValue("webkitTemporaryStorage", branded("DeprecatedStorageQuota", { queryUsageAndQuota: function () {} }));
-  navigatorValue("webkitPersistentStorage", branded("DeprecatedStorageQuota", { queryUsageAndQuota: function () {} }));
-  navigatorValue("scheduling", { isInputPending: function () { return false; } });
+  if (!mobileSafari) {
+    navigatorValue("webkitTemporaryStorage", branded("DeprecatedStorageQuota", { queryUsageAndQuota: function () {} }));
+    navigatorValue("webkitPersistentStorage", branded("DeprecatedStorageQuota", { queryUsageAndQuota: function () {} }));
+    navigatorValue("scheduling", { isInputPending: function () { return false; } });
+  }
   navigatorValue("userActivation", branded("UserActivation", { hasBeenActive: true, isActive: false }));
+
+  if (mobileSafari) {
+    navigatorValue("standalone", false);
+    navigatorValue("share", function share() {
+      return Promise.reject(new DOMException("The request is not allowed by the user agent.", "NotAllowedError"));
+    });
+    navigatorValue("canShare", function canShare() { return false; });
+    navigatorValue("audioSession", branded("AudioSession", { type: "auto" }));
+    navigatorValue("getStorageUpdates", function getStorageUpdates() { return Promise.resolve(); });
+    navigatorValue("mediaCapabilities", branded("MediaCapabilities", {
+      decodingInfo: function () {
+        return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+      },
+      encodingInfo: function () {
+        return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+      }
+    }));
+  }
 
   if (profile.intl && profile.intl.time_zone) {
     var resolved = {
@@ -4513,8 +4546,21 @@
 
     document.scripts = collection(scripts);
 
-    var running = scripts.filter(function (node) { return node.src === spec.current_script; })[0];
-    document.currentScript = running || (scripts.length ? scripts[scripts.length - 1] : null);
+    var current = spec.current_script || "";
+    function resembles(node) {
+      var src = node.src || "";
+      if (!src || !current) return false;
+      if (src === current) return true;
+      if (current.length >= src.length && current.slice(current.length - src.length) === src) return true;
+      if (src.length >= current.length && src.slice(src.length - current.length) === current) return true;
+      return false;
+    }
+    var running = scripts.filter(resembles)[0];
+    if (!running) {
+      var sourced = scripts.filter(function (node) { return !!node.src; });
+      running = sourced.length ? sourced[sourced.length - 1] : null;
+    }
+    document.currentScript = running;
 
     var forms = parsed
       ? parsed.forms
@@ -5077,6 +5123,39 @@
     return { touches: points, targetTouches: points, changedTouches: points };
   }
 
+  if (mobileSafari) {
+    var windowOrientation = profile.orientation && typeof profile.orientation.angle === "number"
+      ? profile.orientation.angle
+      : 0;
+
+    Object.defineProperty(globalThis, "orientation", {
+      get: nameAccessor(function () { return windowOrientation; }, "get", "orientation"),
+      set: nameAccessor(function (value) { windowOrientation = Number(value) || 0; }, "set", "orientation"),
+      enumerable: true,
+      configurable: true
+    });
+
+    ["ontouchstart", "ontouchmove", "ontouchend", "ontouchcancel",
+      "ongesturestart", "ongesturechange", "ongestureend"].forEach(function (name) {
+      Object.defineProperty(globalThis, name, {
+        value: null,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+    });
+
+    tag(function GestureEvent(type, options) {
+      UIEvent.call(this, type, options);
+      var source = options || {};
+      this.rotation = source.rotation === undefined ? 0 : source.rotation;
+      this.scale = source.scale === undefined ? 1 : source.scale;
+    }, "GestureEvent", UIEvent);
+
+    delete globalThis.Notification;
+    delete globalThis.PushManager;
+  }
+
   masked.push("Document.prototype");
   masked.push("Element.prototype");
   masked.push("Node.prototype");
@@ -5198,6 +5277,13 @@
         }
       }
 
+      if (!found && wanted) {
+        found = {
+          tagName: "SCRIPT",
+          src: wanted,
+          getAttribute: function (name) { return name === "src" ? wanted : null; }
+        };
+      }
       document.currentScript = found;
       return Boolean(found);
     },

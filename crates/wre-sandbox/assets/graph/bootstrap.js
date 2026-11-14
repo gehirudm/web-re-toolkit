@@ -641,6 +641,7 @@
     for (var e = 0; e < own.length; e += 1) {
       var extra = own[e];
       if (present[extra] || extra === "__ENV" || extra === "__PUMP") continue;
+      if (extra.indexOf("__wre") === 0) continue;
 
       try {
         var check = describeOwn(root, extra);
@@ -788,6 +789,7 @@
     materialize: materialize,
     decode: decode,
     bridge: bridge,
+    isFrame: isFrame,
     nativeSource: nativeSource,
   };
 })();
