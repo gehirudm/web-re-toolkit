@@ -1,0 +1,106 @@
+name: build-wred-windows
+
+# Builds wred.exe for Windows (x86_64-pc-windows-msvc) on a GitHub-hosted
+# runner and uploads it as an artifact. The akamai client is the only one the
+# PC Optimum checker needs; add more target-* features below if required.
+#
+# Trigger it from the Actions tab (Run workflow) or push a tag v*.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    paths:
+      - "clients/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-wred-windows.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wred-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wred-${{ env.TARGET }}
+
+      - name: Toolchain info
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: Build wred.exe
+        run: >
+          cargo build --release --locked -p wre-clientd
+          --no-default-features --features target-akamai
+          --target ${{ env.TARGET }}
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          .\target\${{ env.TARGET }}\release\wred.exe --targets
+          .\target\${{ env.TARGET }}\release\wred.exe --help
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\${{ env.TARGET }}\release\wred.exe" "dist\wred.exe"
+          $hash = (Get-FileHash "dist\wred.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  wred.exe" | Set-Content -NoNewline "dist\SHA256SUMS.txt"
+          Get-Item dist\wred.exe | Select-Object Name, Length
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Upload wred.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: wred-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wred-x86_64-pc-windows-msvc
+          path: dist
+
+      - name: Attach wred.exe to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/wred.exe dist/SHA256SUMS.txt --repo "$REPO" --clobber

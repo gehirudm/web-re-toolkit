@@ -7,3 +7,5 @@ __pycache__/
 *.clean.js
 *.diag.json
 .DS_Store
+bin/*.bak*
+bin/*.exe
