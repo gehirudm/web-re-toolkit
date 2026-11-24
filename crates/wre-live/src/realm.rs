@@ -1665,6 +1665,15 @@ impl Guard {
     }
 }
 
+impl Drop for Guard {
+    fn drop(&mut self) {
+        // Every early return inside an eval must cancel its watchdog too,
+        // otherwise the orphan thread terminates the isolate `timeout` later
+        // and every subsequent eval fails instantly with "ran past the budget".
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
 fn parse_records(raw: &Value) -> Records {
     let mut records = Records::default();
 

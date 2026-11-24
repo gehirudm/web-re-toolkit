@@ -2,6 +2,14 @@
   var env = globalThis.__ENV;
   var pump = globalThis.__PUMP;
 
+  // Keep a handle on the embedder->frame delivery path so a mounted page can be
+  // handed a message that carries the embedder as its source, the way a real
+  // parent frame's postMessage would. The realm's own postMessage can only ever
+  // deliver with the frame itself as the source.
+  globalThis.__wreDeliver = function (message, origin, source) {
+    return env.deliverMessage(message, origin, source);
+  };
+
   delete globalThis.__ENV;
   delete globalThis.__PUMP;
 
@@ -55,7 +63,25 @@
     },
 
     log: function () {
-      return json(env.log);
+      var src = (env.logMirror && env.logMirror.length ? env.logMirror : env.log) || [];
+      var start = src.length > 2500 ? src.length - 2500 : 0;
+      var out = [];
+
+      for (var i = start; i < src.length; i++) {
+        try {
+          var text = JSON.stringify(src[i]);
+
+          if (text.length > 20000) {
+            out.push({ kind: String((src[i] && src[i].kind) || "?"), detail: text.slice(0, 20000) + "<trunc>", at: 0 });
+          } else {
+            out.push(JSON.parse(text));
+          }
+        } catch (entryError) {
+          out.push({ kind: String((src[i] && src[i].kind) || "?"), detail: "<unserializable>", at: 0 });
+        }
+      }
+
+      return out;
     },
 
     layoutMisses: function () {

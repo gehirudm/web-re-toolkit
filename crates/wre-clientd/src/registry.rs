@@ -23,5 +23,8 @@ pub fn build() -> Result<Registry, String> {
     #[cfg(feature = "target-recaptcha")]
     registry.register(wre_client_recaptcha::registration())?;
 
+    #[cfg(feature = "target-turnstile")]
+    registry.register(wre_client_turnstile::registration())?;
+
     Ok(registry)
 }

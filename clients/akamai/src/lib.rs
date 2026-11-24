@@ -25,6 +25,9 @@ use session::{Session, Settings};
 
 pub const ID: &str = "akamai";
 
+const MAX_CHASE_POSTS: usize = 40;
+const MAX_CHASE_MS: u64 = 60_000;
+
 const NOTES: &str = r#"## How a run works
 
 `solve` is the whole flow. It loads the page, mounts the page's own sensor script in the sandbox, plays a pointer and key stream into it, reads back the telemetry the script builds, and posts that payload to the collection endpoint the script names. What comes back is the payload it sent, the endpoint it used, and the cookie jar afterwards, `_abck` included.
@@ -301,7 +304,9 @@ pub fn describe() -> ClientDescriptor {
                 Shape::object(
                     "CookiesInput",
                     [field("set", Shape::optional(Shape::Str))
-                        .summary("A Cookie header to seed the jar with before reading it back")],
+                        .summary("A Cookie header to seed the jar with before reading it back"),
+                     field("all", Shape::optional(Shape::Bool))
+                        .summary("Read the whole jar, not just what the page URL would send")],
                 ),
                 Shape::object(
                     "Cookies",
@@ -490,6 +495,11 @@ fn config_shape() -> Shape {
                           sandbox builds instead, one payload per round, and the edge reads that \
                           differently")
                 .with_default(json!(true)),
+            field("deferred_scripts", Shape::Bool)
+                .summary("Run the page's deferred scripts after the sensor finishes. Some pages \
+                          ship a deferred chunk that stalls the sandbox; turning this off still \
+                          runs inline and non-deferred page scripts but skips deferred ones")
+                .with_default(json!(true)),
             field("wire_pace", Shape::Bool)
                 .summary("Hold each live request until the wall clock reaches the time the \
                           sandbox believes it is. The edge does not read a payload against when it \
@@ -552,6 +562,8 @@ struct Config {
     pixel: bool,
     #[serde(default = "yes")]
     live_xhr: bool,
+    #[serde(default = "yes")]
+    deferred_scripts: bool,
     #[serde(default)]
     wire_pace: bool,
     #[serde(default)]
@@ -718,6 +730,7 @@ impl Akamai {
             behaviour: self.config.behaviour,
             pixel: self.config.pixel,
             live_xhr: self.config.live_xhr,
+            deferred_scripts: self.config.deferred_scripts,
             wire_pace: self.config.wire_pace,
             jitter: self.config.jitter,
             keep_payloads: self.config.keep_payloads,
@@ -758,8 +771,8 @@ impl Akamai {
         // transport fingerprint's user agent and client hints are used instead,
         // so the wire identity follows the TLS fingerprint rather than the
         // sandbox profile's built-in browser.
-        let fingerprint = match (self.config.identity.as_deref(), &self.config.user_agent) {
-            (Some("fingerprint"), None) => self
+        let fingerprint = match self.config.identity.as_deref() {
+            Some("fingerprint") => self
                 .config
                 .fingerprint
                 .as_deref()
@@ -767,17 +780,45 @@ impl Akamai {
             _ => None,
         };
 
-        let user_agent = match &fingerprint {
-            Some(fingerprint) => fingerprint
+        let user_agent = match (&fingerprint, &self.config.user_agent) {
+            (_, Some(explicit)) => explicit.clone(),
+            (Some(fingerprint), None) => fingerprint
                 .user_agent()
                 .unwrap_or_else(|| self.user_agent.clone()),
-            None => self.user_agent.clone(),
+            (None, None) => self.user_agent.clone(),
         };
 
         options.user_agent = Some(user_agent.clone());
-        options.claim = match &fingerprint {
-            Some(_) => None,
-            None => session::claim_of(&profile, &self.user_agent),
+        options.claim = match (&fingerprint, &self.config.user_agent) {
+            (_, Some(explicit)) => {
+                let major = explicit
+                    .split_once("Chrome/")
+                    .map(|(_, rest)| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "131".to_string());
+                let platform = if explicit.contains("Windows") {
+                    "Windows"
+                } else if explicit.contains("Linux") && !explicit.contains("Android") {
+                    "Linux"
+                } else {
+                    "macOS"
+                };
+                Some(wre_client::context::Claim {
+                    user_agent: explicit.clone(),
+                    brands: format!(
+                        "\"Chromium\";v=\"{0}\", \"Google Chrome\";v=\"{0}\", \"Not?A_Brand\";v=\"24\"",
+                        major
+                    ),
+                    mobile: explicit.contains("Android") || explicit.contains("iPhone"),
+                    platform: platform.to_string(),
+                })
+            }
+            (Some(_), None) => None,
+            (None, None) => session::claim_of(&profile, &self.user_agent),
         };
         options.timeout_secs = Some(self.config.timeout_ms.div_ceil(1000).max(1));
         options.jar = Some(self.jar.clone());
@@ -999,6 +1040,29 @@ impl Client for Akamai {
                         posts.push(serde_json::to_value(&sent).unwrap_or(Value::Null));
                         call.progress(round as u64 + 1, rounds as u64, "posted");
                     }
+
+                    if !session.validated() {
+                        let began = std::time::Instant::now();
+                        let ceiling = self.config.wait_ms.max(MAX_CHASE_MS) as f64;
+                        let mut extra = 0usize;
+
+                        while !session.validated() {
+                            call.check()?;
+
+                            if began.elapsed().as_millis() as f64 > ceiling || extra >= MAX_CHASE_POSTS {
+                                break;
+                            }
+
+                            let gap = session.round_gap();
+                            session.nudge(gap)?;
+
+                            let payload = session.payload()?.unwrap_or_else(|| first.clone());
+                            let sent = session.post_payload(&payload, endpoint.as_deref())?;
+                            posts.push(serde_json::to_value(&sent).unwrap_or(Value::Null));
+                            extra += 1;
+                            call.progress(extra as u64, MAX_CHASE_POSTS as u64, "chasing validation");
+                        }
+                    }
                 }
 
                 let cookies = session.cookies();
@@ -1172,13 +1236,18 @@ impl Client for Akamai {
                 // identity set (user-agent / sec-ch-ua*). Overriding those would
                 // either double the UA (append) or desync it from the client
                 // hints; the session's coherent emulated identity is what the
-                // wire carries instead.
+                // wire carries instead. Everything else replaces the session's
+                // default of the same name so the wire carries one value, the
+                // way a browser does.
                 if let Some(headers) = params.get("headers").and_then(Value::as_object) {
                     for (name, value) in headers {
                         if let Some(text) = value.as_str() {
                             if Fingerprint::is_identity_header(name) {
                                 continue;
                             }
+                            request
+                                .headers
+                                .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
                             request = request.header(name.clone(), text.to_string());
                         }
                     }
@@ -1288,7 +1357,39 @@ impl Client for Akamai {
                 }
 
                 let session = self.session()?;
-                let pairs = session.cookie_pairs();
+                let pairs = if params.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                    session
+                        .jar()
+                        .all()
+                        .into_iter()
+                        .map(|cookie| (cookie.name, cookie.value))
+                        .collect::<Vec<(String, String)>>()
+                } else {
+                    session.cookie_pairs()
+                };
+
+                {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/wred_cookies.log")
+                    {
+                        let all: Vec<String> = session
+                            .jar()
+                            .all()
+                            .into_iter()
+                            .map(|cookie| format!("{}/{}/{}", cookie.name, cookie.domain, cookie.path))
+                            .collect();
+                        let _ = writeln!(
+                            file,
+                            "OPCOOKIES page_url={:?} all={:?} pairs={:?}",
+                            self.config.page_url,
+                            all,
+                            pairs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+                        );
+                    }
+                }
 
                 Ok(json!({
                     "header": pairs

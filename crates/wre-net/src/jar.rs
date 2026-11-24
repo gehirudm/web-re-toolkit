@@ -207,6 +207,20 @@ impl CookieStore for Jar {
             self.note(line, uri.path());
         }
 
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/wred_cookies.log")
+            {
+                for line in &lines {
+                    let head = line.split(';').next().unwrap_or_default();
+                    let _ = writeln!(file, "SET {} <- {}", uri, head);
+                }
+            }
+        }
+
         let mut values: Vec<HeaderValue> = Vec::with_capacity(lines.len());
         for line in &lines {
             if let Ok(value) = HeaderValue::from_str(line) {
@@ -215,6 +229,22 @@ impl CookieStore for Jar {
         }
 
         self.store.set_cookies(&mut values.iter(), uri);
+
+        {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/wred_cookies.log")
+            {
+                let names: Vec<String> = self
+                    .store
+                    .get_all()
+                    .map(|cookie| format!("{}@{:?}", cookie.name(), cookie.domain()))
+                    .collect();
+                let _ = writeln!(file, "AFTER {} STORE({}): {:?}", uri, names.len(), names);
+            }
+        }
     }
 
     fn cookies(&self, uri: &Uri, version: Version) -> Cookies {
